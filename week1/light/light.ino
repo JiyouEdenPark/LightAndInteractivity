@@ -1,134 +1,159 @@
 #include <WiFi.h>
 #include <esp_now.h>
 
-// ============================================================================
-// Pin Definitions
-// ============================================================================
-#define LED_PIN    1   // LED pin G1 (PWM capable)
+#define LED_PIN 1
+#define PWM_FREQ 5000
+#define PWM_RES 8
+#define DIM_STEP                                                               \
+  20 // Brightness decrease amount when button pressed / 버튼 눌렀을 때 밝기
+     // 감소량
+#define UPDATE_INT                                                             \
+  10 // Brightness update interval (ms) / 밝기 업데이트 간격 (밀리초)
+#define PLOT_INT                                                               \
+  50 // Serial plotter output interval (ms) / 시리얼 플로터 출력 간격 (밀리초)
+#define FADE_DUR 7000 // Fade in duration (ms) / 페이드 인 지속 시간 (밀리초)
+#define FADE_OUT_DUR                                                           \
+  1000 // Fade out duration (ms) / 페이드 아웃 지속 시간 (밀리초)
 
-// PWM settings
-#define PWM_FREQUENCY 5000
-#define PWM_RESOLUTION 8  // 8-bit resolution (0-255)
+// Brightness control / 밝기 제어
+int brightness = 255; // Current brightness (0-255) / 현재 밝기
+int lastUpdateTime =
+    0; // Last brightness update time / 마지막 밝기 업데이트 시간
+int lastPlotTime =
+    0; // Last serial plotter output time / 마지막 시리얼 플로터 출력 시간
 
-// ============================================================================
-// Global Variables
-// ============================================================================
+// Fade in (brightening) / 페이드 인 (밝아지기)
+int fadeStartTime = 0; // Fade in start time / 페이드 인 시작 시간
+int fadeStartBrightness =
+    0;               // Brightness when fade in started / 페이드 인 시작 시 밝기
+bool fadeIn = false; // Fade in active flag / 페이드 인 활성화 플래그
 
-// Brightness control variables
-static int currentBrightness = 255;  // Current brightness (0-255)
-static unsigned long lastUpdate = 0;
-static const int dimStep = 20;       // Brightness decrease step when button is pressed
-static const int brightenSpeed = 2;  // Brightness increase speed when idle (higher = faster)
-static const int updateInterval = 100; // Update interval in milliseconds
+// Fade out (dimming) / 페이드 아웃 (어두워지기)
+int fadeOutStartTime = 0; // Fade out start time / 페이드 아웃 시작 시간
+int fadeOutStartBrightness =
+    0; // Brightness when fade out started / 페이드 아웃 시작 시 밝기
+int fadeOutTargetBrightness =
+    0;                // Target brightness for fade out / 페이드 아웃 목표 밝기
+bool fadeOut = false; // Fade out active flag / 페이드 아웃 활성화 플래그
 
-// ============================================================================
-// Utility Functions
-// ============================================================================
-
-/**
- * Print MAC address as 12-digit hex string
- */
-static void printMac12(const uint8_t mac[6]) {
+void printMac(const uint8_t mac[6]) {
   for (int i = 0; i < 6; i++) {
-    if (mac[i] < 16) Serial.print('0');
+    if (mac[i] < 16)
+      Serial.print('0');
     Serial.print(mac[i], HEX);
   }
 }
 
-// ============================================================================
-// LED Control Functions
-// ============================================================================
-
-/**
- * Set LED brightness
- * @param brightness Brightness value (0-255)
- */
-static void setLedBrightness(int brightness) {
-  // Clamp brightness to valid range
-  if (brightness < 0) brightness = 0;
-  if (brightness > 255) brightness = 255;
-  
-  currentBrightness = brightness;
-  
-  // Set LED brightness using PWM
+void setBrightness(int b) {
+  if (b < 0)
+    b = 0;
+  if (b > 255)
+    b = 255;
+  brightness = b;
   ledcWrite(LED_PIN, brightness);
 }
 
-/**
- * Update LED brightness - gradually brightens when idle
- */
-static void updateBrightness() {
-  unsigned long currentTime = millis();
-  
-  // Update at specified interval
-  if (currentTime - lastUpdate >= updateInterval) {
-    // Always try to brighten when idle (up to maximum 255)
-    if (currentBrightness < 255) {
-      currentBrightness += brightenSpeed;
-      if (currentBrightness > 255) {
-        currentBrightness = 255;
+// Update brightness with fade effects / 페이드 효과를 적용한 밝기 업데이트
+void updateBrightness() {
+  int currentTime = (int)millis();
+  if (currentTime - lastUpdateTime < UPDATE_INT)
+    return;
+  lastUpdateTime = currentTime;
+
+  // Handle fade out (dimming) - has priority / 페이드 아웃 처리 (우선순위 높음)
+  if (fadeOut) {
+    int elapsedTime = currentTime - fadeOutStartTime;
+    if (elapsedTime >= FADE_OUT_DUR) {
+      // Fade out complete / 페이드 아웃 완료
+      brightness = fadeOutTargetBrightness;
+      fadeOut = false;
+      setBrightness(brightness);
+      // Start fade in if not at minimum / 최소값이 아니면 페이드 인 시작
+      if (brightness > 0) {
+        fadeStartTime = currentTime;
+        fadeStartBrightness = brightness;
+        fadeIn = true;
       }
-      setLedBrightness(currentBrightness);
+    } else {
+      // Ease-in quadratic curve (t²): slow start, fast end / 이징 곡선: 초반
+      // 느리게, 후반 빠르게
+      float progress = (float)elapsedTime / FADE_OUT_DUR;
+      int newBrightness =
+          fadeOutStartBrightness -
+          (int)(progress * progress *
+                (fadeOutStartBrightness - fadeOutTargetBrightness));
+      setBrightness(newBrightness);
     }
-    
-    lastUpdate = currentTime;
+  }
+  // Handle fade in (brightening) / 페이드 인 처리
+  else if (fadeIn) {
+    int elapsedTime = currentTime - fadeStartTime;
+    if (elapsedTime >= FADE_DUR) {
+      // Fade in complete / 페이드 인 완료
+      brightness = 255;
+      fadeIn = false;
+      setBrightness(brightness);
+    } else {
+      // Ease-in quadratic curve (t²): slow start, fast end / 이징 곡선: 초반
+      // 느리게, 후반 빠르게
+      float progress = (float)elapsedTime / FADE_DUR;
+      int newBrightness =
+          fadeStartBrightness +
+          (int)(progress * progress * (255 - fadeStartBrightness));
+      setBrightness(newBrightness);
+    }
+  }
+  // Auto start fade in if below maximum / 최대값 미만이면 자동으로 페이드 인
+  // 시작
+  else if (brightness < 255) {
+    fadeStartTime = currentTime;
+    fadeStartBrightness = brightness;
+    fadeIn = true;
   }
 }
 
-// ============================================================================
-// ESP-NOW Receive Callback
-// ============================================================================
+// ESP-NOW receive callback / ESP-NOW 수신 콜백
+void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+  if (len <= 0)
+    return;
 
-/**
- * Callback function called when ESP-NOW data is received
- * Parses the received message and controls LED brightness accordingly
- * @param info ESP-NOW receive information (contains sender MAC address)
- * @param data Received data buffer
- * @param len Length of received data
- */
-static void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
-  if (len <= 0) return;
-  
-  // Print sender MAC address
   Serial.print("[esp-now] received from ");
-  printMac12(info->src_addr);
+  printMac(info->src_addr);
   Serial.print(": ");
-  
-  // Extract printable characters from received data
-  String message;
+
+  // Parse received message / 수신된 메시지 파싱
+  String msg;
   for (int i = 0; i < len; i++) {
     char c = (char)data[i];
-    if (isprint(c)) message += c;
+    if (isprint(c))
+      msg += c;
   }
-  message.trim();
-  message.toUpperCase();
-  Serial.println(message);
+  msg.trim();
+  msg.toUpperCase();
+  Serial.println(msg);
 
-  // Process commands
-  if (message == "DIM") {
-    // Button pressed: decrease brightness by dimStep
-    currentBrightness -= dimStep;
-    if (currentBrightness < 0) {
-      currentBrightness = 0;
-    }
-    setLedBrightness(currentBrightness);
-    Serial.print("[LIGHT] Dimmed -> Brightness: ");
-    Serial.println(currentBrightness);
+  // Handle DIM command / DIM 명령 처리
+  if (msg == "DIM") {
+    fadeIn = false; // Stop fade in / 페이드 인 중지
+    int targetBrightness = brightness - DIM_STEP;
+    if (targetBrightness < 0)
+      targetBrightness = 0;
+    // Start fade out / 페이드 아웃 시작
+    fadeOutStartTime = (int)millis();
+    fadeOutStartBrightness = brightness;
+    fadeOutTargetBrightness = targetBrightness;
+    fadeOut = true;
+    Serial.print("[LIGHT] Fade out: ");
+    Serial.print(brightness);
+    Serial.print(" -> ");
+    Serial.println(targetBrightness);
   }
 }
 
-// ============================================================================
-// Setup Function
-// ============================================================================
-
-/**
- * Initialize the device and ESP-NOW communication
- */
 void setup() {
   Serial.begin(115200);
   delay(100);
 
-  // Initialize ESP-NOW
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   if (esp_now_init() != ESP_OK) {
@@ -139,30 +164,27 @@ void setup() {
   }
   esp_now_register_recv_cb(onDataRecv);
 
-  // Print own MAC address for peer configuration
-  uint8_t selfMac[6];
-  WiFi.macAddress(selfMac);
-  Serial.print("Self MAC12: ");
-  printMac12(selfMac);
-  Serial.println();
+  // uint8_t mac[6];
+  // WiFi.macAddress(mac);
+  // Serial.print("Self MAC12: ");
+  // printMac(mac);
+  // Serial.println();
   Serial.println("ESP-NOW LIGHT ready.");
 
-  // Initialize PWM for LED (ESP32-C6 uses ledcAttach)
-  ledcAttach(LED_PIN, PWM_FREQUENCY, PWM_RESOLUTION);
-  setLedBrightness(255);  // Start at full brightness
+  ledcAttach(LED_PIN, PWM_FREQ, PWM_RES);
+  setBrightness(255);
 }
 
-// ============================================================================
-// Main Loop
-// ============================================================================
-
-/**
- * Main program loop
- * Continuously updates LED brightness for smooth fade effect
- */
 void loop() {
-  // Update brightness gradually
-  updateBrightness();
-  
+  updateBrightness(); // Update brightness with fade effects / 페이드 효과로
+                      // 밝기 업데이트
+
+  // Output brightness to serial plotter / 시리얼 플로터에 밝기 출력
+  int currentTime = (int)millis();
+  if (currentTime - lastPlotTime >= PLOT_INT) {
+    Serial.println(brightness);
+    lastPlotTime = currentTime;
+  }
+
   delay(10);
 }
